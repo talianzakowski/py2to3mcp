@@ -12,10 +12,10 @@ This repository contains two MCP (Model Context Protocol) servers that extend Cl
 
 ## Setup from First Principles
 
-### 1. Clone or Create the Project
+### 1. Clone the Repository
 
 ```bash
-mkdir myfirstMCPserver
+git clone <repository-url>
 cd myfirstMCPserver
 ```
 
@@ -29,44 +29,49 @@ source mcp-venv/bin/activate  # On Windows: mcp-venv\Scripts\activate
 ### 3. Install Dependencies
 
 ```bash
-pip install mcp fissix
+pip install -r requirements.txt
 ```
 
+This installs:
 - `mcp` - Model Context Protocol SDK
 - `fissix` - Modern lib2to3 fork for Python 3.9+ (used by py2to3 server)
 
-### 4. Create the Server Files
+### 4. Configure Claude Code
 
-Copy `mcp_server.py` and `py2to3_server.py` to your project directory.
+**File to edit:** `~/.claude.json`
 
-### 5. Configure Claude Code
-
-Add the MCP servers to your Claude Code configuration. Edit `~/.claude.json` and add the following under your project path:
+Add the MCP servers to your Claude Code configuration. Open `~/.claude.json` in your editor and add the following under your project path:
 
 ```json
 {
-  "/path/to/your/myfirstMCPserver": {
+  "/absolute/path/to/myfirstMCPserver": {
     "mcpServers": {
       "my-first-server": {
-        "command": "/path/to/your/myfirstMCPserver/mcp-venv/bin/python",
-        "args": ["/path/to/your/myfirstMCPserver/mcp_server.py"]
+        "command": "/absolute/path/to/myfirstMCPserver/mcp-venv/bin/python",
+        "args": ["/absolute/path/to/myfirstMCPserver/mcp_server.py"]
       },
       "py2to3-migration": {
-        "command": "/path/to/your/myfirstMCPserver/mcp-venv/bin/python",
-        "args": ["/path/to/your/myfirstMCPserver/py2to3_server.py"]
+        "command": "/absolute/path/to/myfirstMCPserver/mcp-venv/bin/python",
+        "args": ["/absolute/path/to/myfirstMCPserver/py2to3_server.py"]
       }
     }
   }
 }
 ```
 
-**Important:** Replace `/path/to/your/myfirstMCPserver` with the actual absolute path to your project directory.
+**Important notes:**
+- Replace `/absolute/path/to/myfirstMCPserver` with the actual absolute path to your project
+- Use `mcpServers` (camelCase) - NOT `mcp_servers`
+- All paths must be absolute, not relative
+- On Windows, use forward slashes or escaped backslashes in paths
 
-### 6. Restart Claude Code
+### 5. Restart Claude Code
 
-After editing the configuration, restart Claude Code (or reload the VS Code window) for the MCP servers to be loaded.
+After editing `~/.claude.json`, restart Claude Code:
+- **CLI:** Exit and restart the CLI
+- **VS Code:** Reload the window (Cmd/Ctrl+Shift+P → "Reload Window")
 
-### 7. Verify the Servers
+### 6. Verify the Servers
 
 Ask Claude: "Can you see the MCP servers?"
 
@@ -115,16 +120,19 @@ Claude should list the available tools from both servers.
 
 ### MCP server not connecting
 
-1. **Check the Python path** - Ensure the command points to the venv's Python:
+1. **Check the config file location** - Must be `~/.claude.json` (not `~/.claude/settings.json`)
+
+2. **Check the Python path** - Ensure the command points to the venv's Python:
    ```bash
-   which python  # Should show your venv path when activated
+   # Get the absolute path
+   /path/to/myfirstMCPserver/mcp-venv/bin/python --version
    ```
 
-2. **Check config syntax** - Use `mcpServers` (camelCase), not `mcp_servers`
+3. **Check config syntax** - Use `mcpServers` (camelCase), not `mcp_servers`
 
-3. **Check file permissions** - Ensure the .py files are readable
+4. **Check file permissions** - Ensure the .py files are readable
 
-4. **Test manually** - Run the server directly to check for errors:
+5. **Test manually** - Run the server directly to check for errors:
    ```bash
    /path/to/mcp-venv/bin/python /path/to/mcp_server.py
    ```
@@ -134,6 +142,7 @@ Claude should list the available tools from both servers.
 
 - Restart Claude Code after configuration changes
 - Check that the config is under the correct project path in `~/.claude.json`
+- Verify JSON syntax is valid (no trailing commas, proper quotes)
 
 ## Creating Your Own MCP Server
 
