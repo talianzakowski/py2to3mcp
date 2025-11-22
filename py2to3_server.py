@@ -1,0 +1,931 @@
+import asyncio
+import ast
+import re
+import subprocess
+import tempfile
+import os
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent, Resource
+
+# Try to import fissix (modern lib2to3 fork for Python 3.9+)
+try:
+    from fissix import refactor
+    HAS_FISSIX = True
+except ImportError:
+    HAS_FISSIX = False
+
+server = Server("py2to3-migration")
+
+# Python 2 patterns to detect (regex-based fallback + additional patterns)
+PY2_PATTERNS = {
+    # Print and I/O
+    "print_statement": r'^[^#]*\bprint\s+[^(=]',
+    "raw_input": r'\braw_input\s*\(',
+    "execfile": r'\bexecfile\s*\(',
+
+    # String/Unicode
+    "unicode_literal": r'\bu["\']',
+    "unicode_type": r'\bunicode\s*\(',
+    "basestring": r'\bbasestring\b',
+    "backticks": r'`[^`]+`',
+
+    # Numbers - improved to catch hex long literals
+    "long_suffix": r'(?:\d+|0[xX][0-9a-fA-F]+)[lL]\b',
+    "old_octal": r'(?<!\w)0\d{2,}(?![xXbBoOlL])\b',
+
+    # Iterators and functions
+    "xrange": r'\bxrange\s*\(',
+    "reduce": r'(?<![\.\w])reduce\s*\(',
+    "apply": r'(?<!\w)apply\s*\(',
+    "cmp_func": r'\bcmp\s*[(\=]',  # cmp() or cmp=
+    "coerce": r'\bcoerce\s*\(',
+    "intern": r'(?<!sys\.)intern\s*\(',
+    "file_builtin": r'(?<!\w)file\s*\(',
+    "buffer_builtin": r'(?<!\w)buffer\s*\(',
+
+    # Dictionary methods
+    "iteritems": r'\.iteritems\s*\(',
+    "iterkeys": r'\.iterkeys\s*\(',
+    "itervalues": r'\.itervalues\s*\(',
+    "has_key": r'\.has_key\s*\(',
+    "viewitems": r'\.viewitems\s*\(',
+    "viewkeys": r'\.viewkeys\s*\(',
+    "viewvalues": r'\.viewvalues\s*\(',
+
+    # Operators and syntax
+    "old_ne": r'<>',
+    "except_comma": r'except\s+[\w.]+\s*,\s*\w+',
+    "old_raise": r'raise\s+[\w.]+\s*,',
+    "old_repr": r'`[^`]+`',
+
+    # Renamed modules
+    "configparser": r'(?<!\w)ConfigParser\b',
+    "queue_module": r'(?<!\w)Queue\b',
+    "urllib2": r'\burllib2\b',
+    "urlparse": r'\burlparse\b',
+    "stringio": r'(?<!\w)StringIO\b',
+    "cstringio": r'\bcStringIO\b',
+    "cpickle": r'\bcPickle\b',
+    "tkinter": r'(?<!\w)Tkinter\b',
+    "http_cookiejar": r'\bcookielib\b',
+    "thread_module": r'(?<!\w)thread\b(?!ing)',
+    "commands_module": r'\bcommands\b',
+    "htmlparser": r'\bHTMLParser\b',
+    "httplib": r'\bhttplib\b',
+}
+
+def get_fissix_fixers():
+    """Get all available fissix fixers for comprehensive detection."""
+    if not HAS_FISSIX:
+        return []
+
+    from fissix import fixes
+    import pkgutil
+
+    fixer_names = []
+    for importer, modname, ispkg in pkgutil.iter_modules(fixes.__path__):
+        if modname.startswith('fix_'):
+            fixer_names.append(f'fissix.fixes.{modname}')
+    return fixer_names
+
+def analyze_with_fissix(code):
+    """Use fissix to analyze code and find Python 2 patterns."""
+    if not HAS_FISSIX:
+        return []
+
+    issues = []
+
+    # Create a refactoring tool with all fixers
+    fixers = get_fissix_fixers()
+
+    try:
+        rt = refactor.RefactoringTool(fixers, options={'print_function': False})
+
+        # Parse the code
+        tree = rt.refactor_string(code + '\n', '<input>')
+
+        # The refactoring tool will have applied fixes - we can compare
+        # original vs refactored to find issues
+        refactored = str(tree)
+
+        if refactored != code + '\n':
+            # Find differences line by line
+            orig_lines = code.split('\n')
+            new_lines = refactored.rstrip('\n').split('\n')
+
+            for i, (orig, new) in enumerate(zip(orig_lines, new_lines), 1):
+                if orig != new:
+                    issues.append({
+                        'line': i,
+                        'original': orig,
+                        'converted': new,
+                        'type': 'fissix_conversion'
+                    })
+    except Exception as e:
+        # If fissix parsing fails, that's also useful info
+        issues.append({
+            'line': 0,
+            'original': str(e),
+            'converted': '',
+            'type': 'parse_error'
+        })
+
+    return issues
+
+@server.list_tools()
+async def list_tools():
+    return [
+        Tool(
+            name="analyze_py2_code",
+            description="Analyze Python code for Python 2 patterns that need migration to Python 3. Returns a list of issues found with line numbers and descriptions.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to analyze"
+                    }
+                },
+                "required": ["code"]
+            }
+        ),
+        Tool(
+            name="run_2to3",
+            description="Run Python's 2to3 tool on code and return the suggested changes as a diff",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python 2 code to convert"
+                    }
+                },
+                "required": ["code"]
+            }
+        ),
+        Tool(
+            name="convert_print_statements",
+            description="Convert Python 2 print statements to Python 3 print() functions",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code with print statements"
+                    }
+                },
+                "required": ["code"]
+            }
+        ),
+        Tool(
+            name="check_syntax",
+            description="Check if code is valid Python 3 syntax",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to check"
+                    }
+                },
+                "required": ["code"]
+            }
+        ),
+        Tool(
+            name="get_migration_guide",
+            description="Get a migration guide for a specific Python 2 to 3 issue",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue": {
+                        "type": "string",
+                        "description": "The issue type (e.g., 'print', 'unicode', 'dict_methods', 'exceptions')"
+                    }
+                },
+                "required": ["issue"]
+            }
+        ),
+        Tool(
+            name="analyze_directory",
+            description="Scan a directory for Python 2 patterns across all .py files. Returns a summary report with issue counts per file.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to scan"
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Patterns to exclude (e.g., 'venv', '__pycache__', 'node_modules')"
+                    }
+                },
+                "required": ["path"]
+            }
+        ),
+        Tool(
+            name="convert_file",
+            description="Convert a Python 2 file to Python 3 in place, with automatic backup",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the Python file to convert"
+                    },
+                    "backup": {
+                        "type": "boolean",
+                        "description": "Create a .py2.bak backup file (default: true)"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Show changes without writing (default: false)"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        ),
+        Tool(
+            name="migration_report",
+            description="Generate a comprehensive migration report for a directory with prioritized files and effort estimates",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path to analyze"
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Patterns to exclude"
+                    }
+                },
+                "required": ["path"]
+            }
+        )
+    ]
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    if name == "analyze_py2_code":
+        code = arguments.get("code", "")
+        issues = []
+        issue_counts = {}  # Track counts by category
+        lines = code.split('\n')
+        fissix_conversions = {}  # Track fissix-suggested conversions
+
+        # First, use fissix for comprehensive AST-based analysis
+        if HAS_FISSIX:
+            fissix_issues = analyze_with_fissix(code)
+            for issue in fissix_issues:
+                if issue['type'] == 'fissix_conversion':
+                    fissix_conversions[issue['line']] = issue['converted']
+
+        # Pattern descriptions
+        issue_descriptions = {
+            # Print and I/O
+            "print_statement": "Print statement (use print() function)",
+            "raw_input": "raw_input() (use input() in Python 3)",
+            "execfile": "execfile() (use exec(open().read()))",
+
+            # String/Unicode
+            "unicode_literal": "Unicode literal u'' (not needed in Python 3)",
+            "unicode_type": "unicode() (use str in Python 3)",
+            "basestring": "basestring (use str in Python 3)",
+            "backticks": "Backticks `x` for repr (use repr(x))",
+
+            # Numbers
+            "long_suffix": "Long integer suffix L (not needed in Python 3)",
+            "old_octal": "Old octal literal 0755 (use 0o755)",
+
+            # Iterators and functions
+            "xrange": "xrange() (use range() in Python 3)",
+            "reduce": "reduce() (import from functools)",
+            "apply": "apply() (use func(*args, **kwargs))",
+            "cmp_func": "cmp() or cmp= (removed in Python 3)",
+            "coerce": "coerce() (removed in Python 3)",
+            "intern": "intern() (use sys.intern())",
+            "file_builtin": "file() builtin (use open())",
+            "buffer_builtin": "buffer() (use memoryview())",
+
+            # Dictionary methods
+            "iteritems": ".iteritems() (use .items() in Python 3)",
+            "iterkeys": ".iterkeys() (use .keys() in Python 3)",
+            "itervalues": ".itervalues() (use .values() in Python 3)",
+            "has_key": ".has_key() (use 'in' operator)",
+            "viewitems": ".viewitems() (use .items() in Python 3)",
+            "viewkeys": ".viewkeys() (use .keys() in Python 3)",
+            "viewvalues": ".viewvalues() (use .values() in Python 3)",
+
+            # Operators and syntax
+            "old_ne": "<> operator (use !=)",
+            "except_comma": "Old except syntax (use 'as' keyword)",
+            "old_raise": "Old raise syntax (use raise E('msg'))",
+            "old_repr": "Backticks for repr (use repr())",
+
+            # Renamed modules
+            "configparser": "ConfigParser (use configparser)",
+            "queue_module": "Queue (use queue)",
+            "urllib2": "urllib2 (use urllib.request)",
+            "urlparse": "urlparse (use urllib.parse)",
+            "stringio": "StringIO (use io.StringIO)",
+            "cstringio": "cStringIO (use io.StringIO)",
+            "cpickle": "cPickle (use pickle)",
+            "tkinter": "Tkinter (use tkinter)",
+            "http_cookiejar": "cookielib (use http.cookiejar)",
+            "thread_module": "thread (use _thread or threading)",
+            "commands_module": "commands (use subprocess)",
+            "htmlparser": "HTMLParser (use html.parser)",
+            "httplib": "httplib (use http.client)",
+        }
+
+        # Regex-based pattern matching
+        for i, line in enumerate(lines, 1):
+            # Skip shebang and encoding lines
+            if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                continue
+
+            for pattern_name, pattern in PY2_PATTERNS.items():
+                if re.search(pattern, line):
+                    # Track count
+                    issue_counts[pattern_name] = issue_counts.get(pattern_name, 0) + 1
+
+                    issue_desc = issue_descriptions.get(pattern_name, pattern_name)
+                    issues.append(f"Line {i}: {issue_desc}")
+                    issues.append(f"  → {line.strip()}")
+
+                    # Show fissix conversion if available
+                    if i in fissix_conversions:
+                        issues.append(f"  ✓ {fissix_conversions[i].strip()}")
+
+        if not issues:
+            return [TextContent(type="text", text="No Python 2 patterns detected. Code appears Python 3 compatible.")]
+
+        # Build summary statistics
+        total = len([x for x in issues if x.startswith('Line ')])
+
+        # Group counts by category
+        categories = {
+            "Print/IO": ["print_statement", "raw_input", "execfile"],
+            "String/Unicode": ["unicode_literal", "unicode_type", "basestring", "backticks", "old_repr"],
+            "Numbers": ["long_suffix", "old_octal"],
+            "Builtins": ["xrange", "reduce", "apply", "cmp_func", "coerce", "intern", "file_builtin", "buffer_builtin"],
+            "Dict methods": ["iteritems", "iterkeys", "itervalues", "has_key", "viewitems", "viewkeys", "viewvalues"],
+            "Syntax": ["old_ne", "except_comma", "old_raise"],
+            "Imports": ["configparser", "queue_module", "urllib2", "urlparse", "stringio", "cstringio", "cpickle", "tkinter", "http_cookiejar", "thread_module", "commands_module", "htmlparser", "httplib"],
+        }
+
+        summary = f"## Analysis Summary\n\n**Total issues found: {total}**\n"
+        if HAS_FISSIX:
+            summary += "*Analysis powered by fissix*\n\n"
+        else:
+            summary += "*Install fissix for enhanced analysis: pip install fissix*\n\n"
+
+        summary += "### By Category:\n"
+
+        for cat_name, patterns in categories.items():
+            cat_count = sum(issue_counts.get(p, 0) for p in patterns)
+            if cat_count > 0:
+                summary += f"- **{cat_name}**: {cat_count}\n"
+
+        summary += "\n### Detailed Breakdown:\n"
+        for pattern, count in sorted(issue_counts.items(), key=lambda x: -x[1]):
+            summary += f"- {pattern}: {count}\n"
+
+        summary += "\n---\n\n### Detailed Issues:\n\n"
+
+        result = summary + "\n".join(issues)
+        return [TextContent(type="text", text=result)]
+
+    elif name == "run_2to3":
+        code = arguments.get("code", "")
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(code)
+            temp_path = f.name
+
+        try:
+            if HAS_FISSIX:
+                # Use fissix (modern lib2to3 fork, Python 3.9+ compatible)
+                from fissix import main as fissix_main
+                import sys
+                from io import StringIO
+
+                # Capture output
+                old_stdout = sys.stdout
+                old_stderr = sys.stderr
+                sys.stdout = StringIO()
+                sys.stderr = StringIO()
+
+                try:
+                    # Run fissix refactoring
+                    fissix_main.main("fissix.fixes", args=['-w', '-n', temp_path])
+                    stdout_val = sys.stdout.getvalue()
+                    stderr_val = sys.stderr.getvalue()
+                except SystemExit:
+                    stdout_val = sys.stdout.getvalue()
+                    stderr_val = sys.stderr.getvalue()
+                finally:
+                    sys.stdout = old_stdout
+                    sys.stderr = old_stderr
+
+                # Read converted file
+                with open(temp_path, 'r') as f:
+                    converted = f.read()
+
+                output = f"=== fissix Output (Python 3.9+ compatible) ===\n{stdout_val}\n{stderr_val}\n\n"
+                output += f"=== Converted Code ===\n{converted}"
+            else:
+                # Fall back to system 2to3
+                result = subprocess.run(
+                    ['2to3', '-w', '-n', temp_path],
+                    capture_output=True,
+                    text=True
+                )
+
+                with open(temp_path, 'r') as f:
+                    converted = f.read()
+
+                output = f"=== 2to3 Output ===\n{result.stdout}\n{result.stderr}\n\n"
+                output += f"=== Converted Code ===\n{converted}"
+
+            return [TextContent(type="text", text=output)]
+        except FileNotFoundError:
+            return [TextContent(type="text", text="Error: Neither fissix nor 2to3 found. Install fissix: pip install fissix")]
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error during conversion: {str(e)}")]
+        finally:
+            os.unlink(temp_path)
+
+    elif name == "convert_print_statements":
+        code = arguments.get("code", "")
+
+        # Simple print statement conversion
+        # Handles: print "text" → print("text")
+        #          print x, y → print(x, y)
+
+        lines = code.split('\n')
+        converted = []
+
+        for line in lines:
+            # Match print statement (not already a function call)
+            match = re.match(r'^(\s*)print\s+(?!\()(.*?)(\s*#.*)?$', line)
+            if match:
+                indent = match.group(1)
+                content = match.group(2).rstrip()
+                comment = match.group(3) or ''
+
+                # Handle trailing comma (no newline)
+                if content.endswith(','):
+                    content = content[:-1]
+                    converted.append(f"{indent}print({content}, end=' '){comment}")
+                else:
+                    converted.append(f"{indent}print({content}){comment}")
+            else:
+                converted.append(line)
+
+        result = '\n'.join(converted)
+        return [TextContent(type="text", text=result)]
+
+    elif name == "check_syntax":
+        code = arguments.get("code", "")
+
+        try:
+            ast.parse(code)
+            return [TextContent(type="text", text="✓ Valid Python 3 syntax")]
+        except SyntaxError as e:
+            return [TextContent(type="text", text=f"✗ Syntax error at line {e.lineno}: {e.msg}\n  {e.text}")]
+
+    elif name == "get_migration_guide":
+        issue = arguments.get("issue", "").lower()
+
+        guides = {
+            "print": """## Print Statement → Print Function
+
+Python 2:
+```python
+print "Hello"
+print x, y
+print >>sys.stderr, "error"
+```
+
+Python 3:
+```python
+print("Hello")
+print(x, y)
+print("error", file=sys.stderr)
+```
+
+For compatibility, add at top of file:
+```python
+from __future__ import print_function
+```""",
+
+            "unicode": """## Unicode Changes
+
+Python 2:
+```python
+u"unicode string"
+"byte string"
+unicode(x)
+```
+
+Python 3:
+```python
+"unicode string"  # All strings are unicode
+b"byte string"    # Explicit bytes
+str(x)            # unicode → str
+```
+
+For compatibility:
+```python
+from __future__ import unicode_literals
+```""",
+
+            "dict_methods": """## Dictionary Methods
+
+Python 2:
+```python
+d.iteritems()
+d.iterkeys()
+d.itervalues()
+d.has_key(k)
+```
+
+Python 3:
+```python
+d.items()      # Returns view, not list
+d.keys()       # Returns view
+d.values()     # Returns view
+k in d         # Use 'in' operator
+```
+
+If you need a list:
+```python
+list(d.items())
+```""",
+
+            "exceptions": """## Exception Handling
+
+Python 2:
+```python
+except Exception, e:
+    pass
+
+raise ValueError, "message"
+```
+
+Python 3:
+```python
+except Exception as e:
+    pass
+
+raise ValueError("message")
+```""",
+
+            "division": """## Division
+
+Python 2:
+```python
+5 / 2  # = 2 (integer division)
+```
+
+Python 3:
+```python
+5 / 2   # = 2.5 (true division)
+5 // 2  # = 2 (integer division)
+```
+
+For compatibility:
+```python
+from __future__ import division
+```""",
+
+            "imports": """## Changed Imports
+
+Python 2 → Python 3:
+- `ConfigParser` → `configparser`
+- `Queue` → `queue`
+- `cPickle` → `pickle`
+- `urllib2` → `urllib.request`
+- `urlparse` → `urllib.parse`
+- `StringIO` → `io.StringIO`
+- `cStringIO` → `io.StringIO`
+
+Use `six` or `future` libraries for compatibility.
+"""
+        }
+
+        if issue in guides:
+            return [TextContent(type="text", text=guides[issue])]
+        else:
+            available = ", ".join(guides.keys())
+            return [TextContent(type="text", text=f"Unknown issue type. Available guides: {available}")]
+
+    elif name == "analyze_directory":
+        path = arguments.get("path", "")
+        exclude = arguments.get("exclude", ["venv", "__pycache__", ".git", "node_modules", ".tox", "build", "dist", "*.egg-info"])
+
+        if not os.path.isdir(path):
+            return [TextContent(type="text", text=f"Error: '{path}' is not a valid directory")]
+
+        results = []
+        total_issues = 0
+        files_with_issues = 0
+
+        for root, dirs, files in os.walk(path):
+            # Filter excluded directories
+            dirs[:] = [d for d in dirs if not any(
+                d == ex or d.endswith(ex.lstrip('*')) for ex in exclude
+            )]
+
+            for file in files:
+                if not file.endswith('.py'):
+                    continue
+
+                filepath = os.path.join(root, file)
+                rel_path = os.path.relpath(filepath, path)
+
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        code = f.read()
+
+                    # Count issues in this file
+                    file_issues = 0
+                    lines = code.split('\n')
+
+                    for i, line in enumerate(lines, 1):
+                        if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                            continue
+                        for pattern in PY2_PATTERNS.values():
+                            if re.search(pattern, line):
+                                file_issues += 1
+
+                    if file_issues > 0:
+                        results.append((rel_path, file_issues))
+                        total_issues += file_issues
+                        files_with_issues += 1
+
+                except Exception as e:
+                    results.append((rel_path, f"Error: {str(e)}"))
+
+        # Sort by issue count descending
+        results.sort(key=lambda x: x[1] if isinstance(x[1], int) else 0, reverse=True)
+
+        output = f"## Directory Analysis: {path}\n\n"
+        output += f"**Total files scanned:** {len(results) + (files_with_issues - len([r for r in results if isinstance(r[1], int)]))}\n"
+        output += f"**Files with issues:** {files_with_issues}\n"
+        output += f"**Total issues found:** {total_issues}\n\n"
+
+        if results:
+            output += "### Files by Issue Count:\n\n"
+            for filepath, count in results:
+                if isinstance(count, int):
+                    output += f"- `{filepath}`: {count} issues\n"
+                else:
+                    output += f"- `{filepath}`: {count}\n"
+        else:
+            output += "No Python 2 patterns found!\n"
+
+        return [TextContent(type="text", text=output)]
+
+    elif name == "convert_file":
+        file_path = arguments.get("file_path", "")
+        backup = arguments.get("backup", True)
+        dry_run = arguments.get("dry_run", False)
+
+        if not os.path.isfile(file_path):
+            return [TextContent(type="text", text=f"Error: '{file_path}' is not a valid file")]
+
+        if not file_path.endswith('.py'):
+            return [TextContent(type="text", text=f"Error: '{file_path}' is not a Python file")]
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                original_code = f.read()
+
+            if not HAS_FISSIX:
+                return [TextContent(type="text", text="Error: fissix is required for file conversion. Install with: pip install fissix")]
+
+            # Use fissix to convert
+            fixers = get_fissix_fixers()
+            rt = refactor.RefactoringTool(fixers, options={'print_function': False})
+            tree = rt.refactor_string(original_code + '\n', file_path)
+            converted_code = str(tree).rstrip('\n')
+
+            if converted_code == original_code:
+                return [TextContent(type="text", text=f"No changes needed for '{file_path}'")]
+
+            if dry_run:
+                # Show diff
+                import difflib
+                diff = difflib.unified_diff(
+                    original_code.splitlines(keepends=True),
+                    converted_code.splitlines(keepends=True),
+                    fromfile=f"{file_path} (original)",
+                    tofile=f"{file_path} (converted)"
+                )
+                diff_text = ''.join(diff)
+                return [TextContent(type="text", text=f"## Dry Run - Changes for {file_path}:\n\n```diff\n{diff_text}\n```")]
+
+            # Create backup if requested
+            if backup:
+                backup_path = file_path + '.py2.bak'
+                with open(backup_path, 'w', encoding='utf-8') as f:
+                    f.write(original_code)
+
+            # Write converted file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(converted_code)
+
+            output = f"✓ Converted '{file_path}'\n"
+            if backup:
+                output += f"  Backup saved to: {file_path}.py2.bak\n"
+
+            # Count changes
+            orig_lines = original_code.split('\n')
+            conv_lines = converted_code.split('\n')
+            changed = sum(1 for o, c in zip(orig_lines, conv_lines) if o != c)
+            output += f"  Lines changed: {changed}\n"
+
+            return [TextContent(type="text", text=output)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error converting file: {str(e)}")]
+
+    elif name == "migration_report":
+        path = arguments.get("path", "")
+        exclude = arguments.get("exclude", ["venv", "__pycache__", ".git", "node_modules", ".tox", "build", "dist", "*.egg-info"])
+
+        if not os.path.isdir(path):
+            return [TextContent(type="text", text=f"Error: '{path}' is not a valid directory")]
+
+        file_data = []
+        total_issues = 0
+        category_totals = {}
+
+        categories = {
+            "Print/IO": ["print_statement", "raw_input", "execfile"],
+            "String/Unicode": ["unicode_literal", "unicode_type", "basestring", "backticks", "old_repr"],
+            "Numbers": ["long_suffix", "old_octal"],
+            "Builtins": ["xrange", "reduce", "apply", "cmp_func", "coerce", "intern", "file_builtin", "buffer_builtin"],
+            "Dict methods": ["iteritems", "iterkeys", "itervalues", "has_key", "viewitems", "viewkeys", "viewvalues"],
+            "Syntax": ["old_ne", "except_comma", "old_raise"],
+            "Imports": ["configparser", "queue_module", "urllib2", "urlparse", "stringio", "cstringio", "cpickle", "tkinter", "http_cookiejar", "thread_module", "commands_module", "htmlparser", "httplib"],
+        }
+
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if not any(
+                d == ex or d.endswith(ex.lstrip('*')) for ex in exclude
+            )]
+
+            for file in files:
+                if not file.endswith('.py'):
+                    continue
+
+                filepath = os.path.join(root, file)
+                rel_path = os.path.relpath(filepath, path)
+
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        code = f.read()
+
+                    file_issues = {}
+                    lines = code.split('\n')
+
+                    for i, line in enumerate(lines, 1):
+                        if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                            continue
+                        for pattern_name, pattern in PY2_PATTERNS.items():
+                            if re.search(pattern, line):
+                                file_issues[pattern_name] = file_issues.get(pattern_name, 0) + 1
+
+                    if file_issues:
+                        issue_count = sum(file_issues.values())
+                        file_data.append({
+                            'path': rel_path,
+                            'issues': file_issues,
+                            'total': issue_count,
+                            'lines': len(lines)
+                        })
+                        total_issues += issue_count
+
+                        for pattern, count in file_issues.items():
+                            for cat, patterns in categories.items():
+                                if pattern in patterns:
+                                    category_totals[cat] = category_totals.get(cat, 0) + count
+                                    break
+
+                except Exception:
+                    pass
+
+        # Sort by total issues descending
+        file_data.sort(key=lambda x: x['total'], reverse=True)
+
+        # Generate report
+        output = f"# Migration Report: {path}\n\n"
+        output += "## Executive Summary\n\n"
+        output += f"- **Total files requiring changes:** {len(file_data)}\n"
+        output += f"- **Total issues to address:** {total_issues}\n"
+
+        # Effort estimate (rough: ~2 min per issue for review + fix)
+        hours = (total_issues * 2) / 60
+        if hours < 1:
+            effort = f"{int(hours * 60)} minutes"
+        elif hours < 8:
+            effort = f"{hours:.1f} hours"
+        else:
+            effort = f"{hours/8:.1f} days"
+        output += f"- **Estimated effort:** {effort}\n\n"
+
+        output += "## Issues by Category\n\n"
+        for cat in sorted(category_totals.keys(), key=lambda c: category_totals[c], reverse=True):
+            output += f"- **{cat}:** {category_totals[cat]}\n"
+
+        output += "\n## Priority Files (Most Issues)\n\n"
+        output += "| File | Issues | Lines | Density |\n"
+        output += "|------|--------|-------|--------|\n"
+
+        for fd in file_data[:20]:  # Top 20 files
+            density = fd['total'] / fd['lines'] * 100 if fd['lines'] > 0 else 0
+            output += f"| `{fd['path']}` | {fd['total']} | {fd['lines']} | {density:.1f}% |\n"
+
+        if len(file_data) > 20:
+            output += f"\n*...and {len(file_data) - 20} more files*\n"
+
+        output += "\n## Recommended Migration Order\n\n"
+        output += "1. **Quick wins** - Files with few issues (< 5):\n"
+        quick_wins = [f for f in file_data if f['total'] < 5]
+        for fd in quick_wins[:5]:
+            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
+
+        output += "\n2. **Core modules** - Fix high-density files first to catch patterns:\n"
+        high_density = sorted([f for f in file_data if f['total'] >= 5],
+                             key=lambda x: x['total']/x['lines'] if x['lines'] > 0 else 0,
+                             reverse=True)
+        for fd in high_density[:5]:
+            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
+
+        output += "\n3. **Major refactors** - Largest files with most issues:\n"
+        for fd in file_data[:5]:
+            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
+
+        return [TextContent(type="text", text=output)]
+
+    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+# Resources
+@server.list_resources()
+async def list_resources():
+    return [
+        Resource(
+            uri="guide://py2to3-quickref",
+            name="Python 2 to 3 Quick Reference",
+            description="Quick reference for common Python 2 to 3 migration patterns",
+            mimeType="text/markdown"
+        )
+    ]
+
+@server.read_resource()
+async def read_resource(uri: str):
+    if uri == "guide://py2to3-quickref":
+        return """# Python 2 to 3 Quick Reference
+
+## Most Common Changes
+
+| Python 2 | Python 3 |
+|----------|----------|
+| `print "x"` | `print("x")` |
+| `raw_input()` | `input()` |
+| `xrange()` | `range()` |
+| `d.iteritems()` | `d.items()` |
+| `d.has_key(k)` | `k in d` |
+| `unicode()` | `str()` |
+| `except E, e:` | `except E as e:` |
+
+## Future Imports for Compatibility
+
+```python
+from __future__ import print_function
+from __future__ import division
+from __future__ import unicode_literals
+from __future__ import absolute_import
+```
+
+## Tools
+- `2to3`: Built-in conversion tool
+- `futurize`: Forward-compatible code
+- `modernize`: Similar to futurize
+- `six`: Compatibility library
+"""
+    return "Resource not found"
+
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(read_stream, write_stream, server.create_initialization_options())
+
+if __name__ == "__main__":
+    asyncio.run(main())
