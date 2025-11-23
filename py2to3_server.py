@@ -401,6 +401,38 @@ async def list_tools():
                 },
                 "required": ["path"]
             }
+        ),
+        Tool(
+            name="validate_conversion",
+            description="Validate a converted Python file and identify issues requiring human or AI review. Returns syntax check, remaining patterns, and flags for manual investigation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the converted Python file to validate"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        ),
+        Tool(
+            name="conversion_report",
+            description="Generate a post-conversion report comparing original and converted files. Shows what changed, what needs review, and test recommendations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "original_path": {
+                        "type": "string",
+                        "description": "Path to original file (or .py2.bak backup)"
+                    },
+                    "converted_path": {
+                        "type": "string",
+                        "description": "Path to converted Python 3 file"
+                    }
+                },
+                "required": ["original_path", "converted_path"]
+            }
         )
     ]
 
@@ -1157,6 +1189,318 @@ Use `six` or `future` libraries for compatibility.
         )
 
         return [TextContent(type="text", text=response)]
+
+    elif name == "validate_conversion":
+        file_path = arguments.get("file_path", "")
+
+        if not os.path.isfile(file_path):
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "InvalidFile",
+                    "message": f"'{file_path}' is not a valid file",
+                    "path": file_path,
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
+
+        # FR-0.3: Check file size limit
+        size_error = check_file_size(file_path, name)
+        if size_error:
+            return [TextContent(type="text", text=size_error)]
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+
+            # 1. Syntax check
+            syntax_valid = True
+            syntax_error = None
+            try:
+                ast.parse(code)
+            except SyntaxError as e:
+                syntax_valid = False
+                syntax_error = {
+                    "line": e.lineno,
+                    "message": e.msg,
+                    "text": e.text.strip() if e.text else ""
+                }
+
+            # 2. Check for remaining Python 2 patterns
+            remaining_patterns = []
+            lines = code.split('\n')
+            for i, line in enumerate(lines, 1):
+                if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                    continue
+                for pattern_name, pattern in PY2_PATTERNS.items():
+                    if re.search(pattern, line):
+                        remaining_patterns.append({
+                            "line": i,
+                            "pattern": pattern_name,
+                            "text": line.strip()
+                        })
+
+            # 3. Identify runtime-only issues needing human review
+            needs_human_review = []
+
+            # Patterns that require human judgment
+            runtime_patterns = {
+                r'\bexec\s*\(': {
+                    "issue": "exec() usage",
+                    "reason": "Dynamic code execution may have different behavior in Python 3",
+                    "severity": "high"
+                },
+                r'\beval\s*\(': {
+                    "issue": "eval() usage",
+                    "reason": "Dynamic evaluation may behave differently with string/bytes",
+                    "severity": "medium"
+                },
+                r'(?<![/\d])/(?![/\d*])': {
+                    "issue": "Division operator",
+                    "reason": "Division returns float in Python 3 (was int in Python 2)",
+                    "severity": "high"
+                },
+                r'\bopen\s*\([^)]+\)': {
+                    "issue": "File operations",
+                    "reason": "Default encoding changed; may need explicit encoding parameter",
+                    "severity": "medium"
+                },
+                r'\.encode\s*\(|\.decode\s*\(': {
+                    "issue": "String encoding/decoding",
+                    "reason": "str/bytes handling changed significantly",
+                    "severity": "medium"
+                },
+                r'\bpickle\b': {
+                    "issue": "Pickle usage",
+                    "reason": "Pickle protocol differences between Python 2/3",
+                    "severity": "medium"
+                },
+                r'\bsocket\b': {
+                    "issue": "Socket operations",
+                    "reason": "Socket data is bytes in Python 3",
+                    "severity": "medium"
+                },
+                r'\bsubprocess\b': {
+                    "issue": "Subprocess calls",
+                    "reason": "Output is bytes by default in Python 3",
+                    "severity": "low"
+                },
+                r'sys\.std(in|out|err)': {
+                    "issue": "Standard streams",
+                    "reason": "Standard streams handle text differently in Python 3",
+                    "severity": "low"
+                },
+                r'__metaclass__': {
+                    "issue": "Old metaclass syntax",
+                    "reason": "Use class Foo(metaclass=Meta) in Python 3",
+                    "severity": "high"
+                },
+                r'\.sort\s*\([^)]*cmp\s*=': {
+                    "issue": "sort() with cmp parameter",
+                    "reason": "cmp parameter removed; use key with functools.cmp_to_key",
+                    "severity": "high"
+                },
+            }
+
+            for i, line in enumerate(lines, 1):
+                for pattern, info in runtime_patterns.items():
+                    if re.search(pattern, line):
+                        needs_human_review.append({
+                            "line": i,
+                            "issue": info["issue"],
+                            "reason": info["reason"],
+                            "severity": info["severity"],
+                            "text": line.strip()
+                        })
+
+            # 4. Determine overall status
+            if not syntax_valid:
+                status = "failed"
+            elif remaining_patterns:
+                status = "incomplete"
+            elif needs_human_review:
+                status = "needs_review"
+            else:
+                status = "success"
+
+            # 5. Generate test recommendations
+            test_recommendations = []
+
+            if any(r["issue"] == "Division operator" for r in needs_human_review):
+                test_recommendations.append("Test all arithmetic operations for integer vs float division")
+
+            if any(r["issue"] in ["File operations", "String encoding/decoding"] for r in needs_human_review):
+                test_recommendations.append("Test file I/O with various encodings (UTF-8, Latin-1, etc.)")
+
+            if any(r["issue"] == "Pickle usage" for r in needs_human_review):
+                test_recommendations.append("Test pickle load/dump with data from Python 2")
+
+            if any(r["issue"] in ["Socket operations", "Subprocess calls"] for r in needs_human_review):
+                test_recommendations.append("Test network/subprocess operations for bytes vs str handling")
+
+            if not test_recommendations:
+                test_recommendations.append("Run existing test suite to verify behavior")
+
+            response = create_response(
+                tool_name=name,
+                status="success",
+                data={
+                    "file": file_path,
+                    "validation_status": status,
+                    "syntax_valid": syntax_valid,
+                    "syntax_error": syntax_error,
+                    "remaining_py2_patterns": remaining_patterns,
+                    "needs_human_review": needs_human_review,
+                    "review_count": {
+                        "high_severity": len([r for r in needs_human_review if r["severity"] == "high"]),
+                        "medium_severity": len([r for r in needs_human_review if r["severity"] == "medium"]),
+                        "low_severity": len([r for r in needs_human_review if r["severity"] == "low"]),
+                    },
+                    "test_recommendations": test_recommendations,
+                },
+                metadata={"limits": LIMITS}
+            )
+            return [TextContent(type="text", text=response)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=error_response(name, e, f"validating file: {file_path}"))]
+
+    elif name == "conversion_report":
+        original_path = arguments.get("original_path", "")
+        converted_path = arguments.get("converted_path", "")
+
+        # Validate files exist
+        for path, label in [(original_path, "original"), (converted_path, "converted")]:
+            if not os.path.isfile(path):
+                error_resp = create_response(
+                    tool_name=name,
+                    status="error",
+                    error={
+                        "type": "InvalidFile",
+                        "message": f"'{path}' ({label}) is not a valid file",
+                        "path": path,
+                    }
+                )
+                return [TextContent(type="text", text=error_resp)]
+
+        try:
+            with open(original_path, 'r', encoding='utf-8', errors='replace') as f:
+                original_code = f.read()
+            with open(converted_path, 'r', encoding='utf-8', errors='replace') as f:
+                converted_code = f.read()
+
+            orig_lines = original_code.split('\n')
+            conv_lines = converted_code.split('\n')
+
+            # 1. Count original issues
+            original_issues = {}
+            for i, line in enumerate(orig_lines, 1):
+                if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                    continue
+                for pattern_name, pattern in PY2_PATTERNS.items():
+                    if re.search(pattern, line):
+                        original_issues[pattern_name] = original_issues.get(pattern_name, 0) + 1
+
+            # 2. Count remaining issues in converted
+            remaining_issues = {}
+            for i, line in enumerate(conv_lines, 1):
+                if i <= 2 and (line.startswith('#!') or 'coding' in line):
+                    continue
+                for pattern_name, pattern in PY2_PATTERNS.items():
+                    if re.search(pattern, line):
+                        remaining_issues[pattern_name] = remaining_issues.get(pattern_name, 0) + 1
+
+            # 3. Calculate what was fixed
+            fixed_issues = {}
+            for pattern, count in original_issues.items():
+                remaining = remaining_issues.get(pattern, 0)
+                if count > remaining:
+                    fixed_issues[pattern] = count - remaining
+
+            # 4. Generate diff summary
+            import difflib
+            differ = difflib.unified_diff(
+                orig_lines,
+                conv_lines,
+                fromfile=original_path,
+                tofile=converted_path,
+                lineterm=''
+            )
+            diff_lines = list(differ)
+
+            additions = len([line for line in diff_lines if line.startswith('+') and not line.startswith('+++')])
+            deletions = len([line for line in diff_lines if line.startswith('-') and not line.startswith('---')])
+
+            # 5. Check syntax of converted file
+            syntax_valid = True
+            try:
+                ast.parse(converted_code)
+            except SyntaxError:
+                syntax_valid = False
+
+            # 6. Determine status
+            total_original = sum(original_issues.values())
+            total_remaining = sum(remaining_issues.values())
+            total_fixed = sum(fixed_issues.values())
+
+            if total_remaining == 0 and syntax_valid:
+                status = "converted"
+                if total_fixed == 0:
+                    status = "no_changes_needed"
+            elif total_remaining > 0:
+                status = "needs_review"
+            elif not syntax_valid:
+                status = "failed"
+            else:
+                status = "converted"
+
+            # 7. Identify what still needs attention
+            needs_attention = []
+            for pattern, count in remaining_issues.items():
+                needs_attention.append({
+                    "pattern": pattern,
+                    "count": count,
+                    "action": "Manual conversion required"
+                })
+
+            response = create_response(
+                tool_name=name,
+                status="success",
+                data={
+                    "original_file": original_path,
+                    "converted_file": converted_path,
+                    "conversion_status": status,
+                    "syntax_valid": syntax_valid,
+                    "summary": {
+                        "original_issues": total_original,
+                        "issues_fixed": total_fixed,
+                        "issues_remaining": total_remaining,
+                        "fix_rate": f"{(total_fixed/total_original*100):.1f}%" if total_original > 0 else "N/A",
+                        "lines_added": additions,
+                        "lines_removed": deletions,
+                    },
+                    "fixed_patterns": fixed_issues,
+                    "remaining_patterns": remaining_issues,
+                    "needs_attention": needs_attention,
+                    "next_steps": [
+                        "Run validate_conversion for detailed review items" if remaining_issues else "Run test suite to verify behavior",
+                        "Check division operations for int vs float" if total_fixed > 0 else None,
+                        "Review file I/O for encoding issues" if any('file' in p or 'io' in p.lower() for p in fixed_issues) else None,
+                    ]
+                },
+                metadata={"limits": LIMITS}
+            )
+
+            # Clean up None values from next_steps
+            response_dict = json.loads(response)
+            response_dict["data"]["next_steps"] = [s for s in response_dict["data"]["next_steps"] if s]
+            response = json.dumps(response_dict, indent=2)
+
+            return [TextContent(type="text", text=response)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=error_response(name, e, "generating conversion report"))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
