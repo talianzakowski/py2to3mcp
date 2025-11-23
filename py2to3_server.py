@@ -4,6 +4,9 @@ import re
 import subprocess
 import tempfile
 import os
+import json
+import traceback
+import time
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, Resource
@@ -16,6 +19,139 @@ except ImportError:
     HAS_FISSIX = False
 
 server = Server("py2to3-migration")
+
+# =============================================================================
+# FR-0.3: Safety & Limits Configuration
+# =============================================================================
+LIMITS = {
+    "max_file_size_bytes": 10 * 1024 * 1024,  # 10 MB per file
+    "max_files_per_operation": 1000,           # Max files to process at once
+    "max_code_length": 1_000_000,              # Max characters for code input
+    "timeout_seconds": 300,                     # 5 minute timeout for operations
+}
+
+# =============================================================================
+# FR-0.2: Common Response Schema
+# =============================================================================
+def create_response(
+    tool_name: str,
+    status: str,
+    data: dict = None,
+    error: dict = None,
+    metadata: dict = None
+) -> str:
+    """
+    Create a standardized JSON response for all tools.
+
+    Args:
+        tool_name: Name of the tool that was called
+        status: "success" or "error"
+        data: The actual result data (for success responses)
+        error: Error details (for error responses)
+        metadata: Additional debugging metadata
+
+    Returns:
+        JSON-formatted response string
+    """
+    response = {
+        "tool": tool_name,
+        "status": status,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    if data is not None:
+        response["data"] = data
+
+    if error is not None:
+        response["error"] = error
+
+    if metadata is not None:
+        response["metadata"] = metadata
+
+    return json.dumps(response, indent=2, default=str)
+
+
+def error_response(tool_name: str, exception: Exception, context: str = None) -> str:
+    """
+    Create a standardized error response with full debugging info.
+
+    Args:
+        tool_name: Name of the tool that failed
+        exception: The exception that was raised
+        context: Additional context about what was being attempted
+
+    Returns:
+        JSON-formatted error response string
+    """
+    tb_lines = traceback.format_exception(type(exception), exception, exception.__traceback__)
+    tb_snippet = ''.join(tb_lines[-3:]) if len(tb_lines) > 3 else ''.join(tb_lines)
+
+    error_detail = {
+        "type": type(exception).__name__,
+        "message": str(exception),
+        "traceback_snippet": tb_snippet.strip(),
+    }
+
+    if context:
+        error_detail["context"] = context
+
+    return create_response(
+        tool_name=tool_name,
+        status="error",
+        error=error_detail,
+        metadata={
+            "limits": LIMITS,
+            "fissix_available": HAS_FISSIX,
+        }
+    )
+
+
+def check_file_size(filepath: str, tool_name: str) -> str:
+    """
+    Check if a file exceeds the size limit.
+
+    Returns:
+        Error response string if limit exceeded, None otherwise
+    """
+    try:
+        size = os.path.getsize(filepath)
+        if size > LIMITS["max_file_size_bytes"]:
+            return create_response(
+                tool_name=tool_name,
+                status="error",
+                error={
+                    "type": "FileSizeLimitExceeded",
+                    "message": f"File size ({size:,} bytes) exceeds limit ({LIMITS['max_file_size_bytes']:,} bytes)",
+                    "file": filepath,
+                    "size_bytes": size,
+                    "limit_bytes": LIMITS["max_file_size_bytes"],
+                }
+            )
+    except OSError as e:
+        return error_response(tool_name, e, f"checking file size: {filepath}")
+
+    return None
+
+
+def check_code_length(code: str, tool_name: str) -> str:
+    """
+    Check if code input exceeds the length limit.
+
+    Returns:
+        Error response string if limit exceeded, None otherwise
+    """
+    if len(code) > LIMITS["max_code_length"]:
+        return create_response(
+            tool_name=tool_name,
+            status="error",
+            error={
+                "type": "CodeLengthLimitExceeded",
+                "message": f"Code length ({len(code):,} chars) exceeds limit ({LIMITS['max_code_length']:,} chars)",
+                "length": len(code),
+                "limit": LIMITS["max_code_length"],
+            }
+        )
+    return None
 
 # Python 2 patterns to detect (regex-based fallback + additional patterns)
 PY2_PATTERNS = {
@@ -272,6 +408,12 @@ async def list_tools():
 async def call_tool(name: str, arguments: dict):
     if name == "analyze_py2_code":
         code = arguments.get("code", "")
+
+        # FR-0.3: Check code length limit
+        limit_error = check_code_length(code, name)
+        if limit_error:
+            return [TextContent(type="text", text=limit_error)]
+
         issues = []
         issue_counts = {}  # Track counts by category
         lines = code.split('\n')
@@ -630,11 +772,22 @@ Use `six` or `future` libraries for compatibility.
         exclude = arguments.get("exclude", ["venv", "__pycache__", ".git", "node_modules", ".tox", "build", "dist", "*.egg-info"])
 
         if not os.path.isdir(path):
-            return [TextContent(type="text", text=f"Error: '{path}' is not a valid directory")]
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "InvalidDirectory",
+                    "message": f"'{path}' is not a valid directory",
+                    "path": path,
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
 
         results = []
         total_issues = 0
         files_with_issues = 0
+        files_scanned = 0
+        skipped_files = []
 
         for root, dirs, files in os.walk(path):
             # Filter excluded directories
@@ -646,8 +799,19 @@ Use `six` or `future` libraries for compatibility.
                 if not file.endswith('.py'):
                     continue
 
+                # FR-0.3: Check file count limit
+                if files_scanned >= LIMITS["max_files_per_operation"]:
+                    skipped_files.append(os.path.join(root, file))
+                    continue
+
                 filepath = os.path.join(root, file)
                 rel_path = os.path.relpath(filepath, path)
+
+                # FR-0.3: Check file size limit
+                size_error = check_file_size(filepath, name)
+                if size_error:
+                    results.append((rel_path, "Skipped: file too large"))
+                    continue
 
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -669,28 +833,45 @@ Use `six` or `future` libraries for compatibility.
                         total_issues += file_issues
                         files_with_issues += 1
 
+                    files_scanned += 1
+
                 except Exception as e:
                     results.append((rel_path, f"Error: {str(e)}"))
 
         # Sort by issue count descending
         results.sort(key=lambda x: x[1] if isinstance(x[1], int) else 0, reverse=True)
 
-        output = f"## Directory Analysis: {path}\n\n"
-        output += f"**Total files scanned:** {len(results) + (files_with_issues - len([r for r in results if isinstance(r[1], int)]))}\n"
-        output += f"**Files with issues:** {files_with_issues}\n"
-        output += f"**Total issues found:** {total_issues}\n\n"
+        # Build response data
+        file_results = []
+        for filepath, count in results:
+            if isinstance(count, int):
+                file_results.append({"file": filepath, "issues": count})
+            else:
+                file_results.append({"file": filepath, "status": count})
 
-        if results:
-            output += "### Files by Issue Count:\n\n"
-            for filepath, count in results:
-                if isinstance(count, int):
-                    output += f"- `{filepath}`: {count} issues\n"
-                else:
-                    output += f"- `{filepath}`: {count}\n"
-        else:
-            output += "No Python 2 patterns found!\n"
+        response_data = {
+            "path": path,
+            "files_scanned": files_scanned,
+            "files_with_issues": files_with_issues,
+            "total_issues": total_issues,
+            "files": file_results,
+        }
 
-        return [TextContent(type="text", text=output)]
+        if skipped_files:
+            response_data["skipped_count"] = len(skipped_files)
+            response_data["skipped_reason"] = f"Exceeded max_files_per_operation limit ({LIMITS['max_files_per_operation']})"
+
+        response = create_response(
+            tool_name=name,
+            status="success",
+            data=response_data,
+            metadata={
+                "limits": LIMITS,
+                "fissix_available": HAS_FISSIX,
+            }
+        )
+
+        return [TextContent(type="text", text=response)]
 
     elif name == "convert_file":
         file_path = arguments.get("file_path", "")
@@ -698,17 +879,48 @@ Use `six` or `future` libraries for compatibility.
         dry_run = arguments.get("dry_run", False)
 
         if not os.path.isfile(file_path):
-            return [TextContent(type="text", text=f"Error: '{file_path}' is not a valid file")]
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "InvalidFile",
+                    "message": f"'{file_path}' is not a valid file",
+                    "path": file_path,
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
 
         if not file_path.endswith('.py'):
-            return [TextContent(type="text", text=f"Error: '{file_path}' is not a Python file")]
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "InvalidFileType",
+                    "message": f"'{file_path}' is not a Python file",
+                    "path": file_path,
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
+
+        # FR-0.3: Check file size limit
+        size_error = check_file_size(file_path, name)
+        if size_error:
+            return [TextContent(type="text", text=size_error)]
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 original_code = f.read()
 
             if not HAS_FISSIX:
-                return [TextContent(type="text", text="Error: fissix is required for file conversion. Install with: pip install fissix")]
+                error_resp = create_response(
+                    tool_name=name,
+                    status="error",
+                    error={
+                        "type": "MissingDependency",
+                        "message": "fissix is required for file conversion. Install with: pip install fissix",
+                    }
+                )
+                return [TextContent(type="text", text=error_resp)]
 
             # Use fissix to convert
             fixers = get_fissix_fixers()
@@ -717,7 +929,16 @@ Use `six` or `future` libraries for compatibility.
             converted_code = str(tree).rstrip('\n')
 
             if converted_code == original_code:
-                return [TextContent(type="text", text=f"No changes needed for '{file_path}'")]
+                response = create_response(
+                    tool_name=name,
+                    status="success",
+                    data={
+                        "file": file_path,
+                        "action": "no_changes_needed",
+                        "message": "File is already Python 3 compatible",
+                    }
+                )
+                return [TextContent(type="text", text=response)]
 
             if dry_run:
                 # Show diff
@@ -729,9 +950,25 @@ Use `six` or `future` libraries for compatibility.
                     tofile=f"{file_path} (converted)"
                 )
                 diff_text = ''.join(diff)
-                return [TextContent(type="text", text=f"## Dry Run - Changes for {file_path}:\n\n```diff\n{diff_text}\n```")]
+
+                orig_lines = original_code.split('\n')
+                conv_lines = converted_code.split('\n')
+                changed = sum(1 for o, c in zip(orig_lines, conv_lines) if o != c)
+
+                response = create_response(
+                    tool_name=name,
+                    status="success",
+                    data={
+                        "file": file_path,
+                        "action": "dry_run",
+                        "lines_changed": changed,
+                        "diff": diff_text,
+                    }
+                )
+                return [TextContent(type="text", text=response)]
 
             # Create backup if requested
+            backup_path = None
             if backup:
                 backup_path = file_path + '.py2.bak'
                 with open(backup_path, 'w', encoding='utf-8') as f:
@@ -741,31 +978,47 @@ Use `six` or `future` libraries for compatibility.
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(converted_code)
 
-            output = f"✓ Converted '{file_path}'\n"
-            if backup:
-                output += f"  Backup saved to: {file_path}.py2.bak\n"
-
             # Count changes
             orig_lines = original_code.split('\n')
             conv_lines = converted_code.split('\n')
             changed = sum(1 for o, c in zip(orig_lines, conv_lines) if o != c)
-            output += f"  Lines changed: {changed}\n"
 
-            return [TextContent(type="text", text=output)]
+            response = create_response(
+                tool_name=name,
+                status="success",
+                data={
+                    "file": file_path,
+                    "action": "converted",
+                    "lines_changed": changed,
+                    "backup_file": backup_path,
+                }
+            )
+            return [TextContent(type="text", text=response)]
 
         except Exception as e:
-            return [TextContent(type="text", text=f"Error converting file: {str(e)}")]
+            return [TextContent(type="text", text=error_response(name, e, f"converting file: {file_path}"))]
 
     elif name == "migration_report":
         path = arguments.get("path", "")
         exclude = arguments.get("exclude", ["venv", "__pycache__", ".git", "node_modules", ".tox", "build", "dist", "*.egg-info"])
 
         if not os.path.isdir(path):
-            return [TextContent(type="text", text=f"Error: '{path}' is not a valid directory")]
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "InvalidDirectory",
+                    "message": f"'{path}' is not a valid directory",
+                    "path": path,
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
 
         file_data = []
         total_issues = 0
         category_totals = {}
+        files_scanned = 0
+        skipped_files = []
 
         categories = {
             "Print/IO": ["print_statement", "raw_input", "execfile"],
@@ -786,8 +1039,20 @@ Use `six` or `future` libraries for compatibility.
                 if not file.endswith('.py'):
                     continue
 
+                # FR-0.3: Check file count limit
+                if files_scanned >= LIMITS["max_files_per_operation"]:
+                    skipped_files.append(os.path.join(root, file))
+                    continue
+
                 filepath = os.path.join(root, file)
                 rel_path = os.path.relpath(filepath, path)
+
+                # FR-0.3: Check file size limit
+                try:
+                    if os.path.getsize(filepath) > LIMITS["max_file_size_bytes"]:
+                        continue  # Skip large files silently in report
+                except OSError:
+                    continue
 
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -819,19 +1084,15 @@ Use `six` or `future` libraries for compatibility.
                                     category_totals[cat] = category_totals.get(cat, 0) + count
                                     break
 
+                    files_scanned += 1
+
                 except Exception:
                     pass
 
         # Sort by total issues descending
         file_data.sort(key=lambda x: x['total'], reverse=True)
 
-        # Generate report
-        output = f"# Migration Report: {path}\n\n"
-        output += "## Executive Summary\n\n"
-        output += f"- **Total files requiring changes:** {len(file_data)}\n"
-        output += f"- **Total issues to address:** {total_issues}\n"
-
-        # Effort estimate (rough: ~2 min per issue for review + fix)
+        # Calculate effort estimate (rough: ~2 min per issue for review + fix)
         hours = (total_issues * 2) / 60
         if hours < 1:
             effort = f"{int(hours * 60)} minutes"
@@ -839,41 +1100,63 @@ Use `six` or `future` libraries for compatibility.
             effort = f"{hours:.1f} hours"
         else:
             effort = f"{hours/8:.1f} days"
-        output += f"- **Estimated effort:** {effort}\n\n"
 
-        output += "## Issues by Category\n\n"
-        for cat in sorted(category_totals.keys(), key=lambda c: category_totals[c], reverse=True):
-            output += f"- **{cat}:** {category_totals[cat]}\n"
+        # Build priority lists
+        quick_wins = [{"file": f['path'], "issues": f['total']} for f in file_data if f['total'] < 5][:5]
+        high_density = sorted(
+            [f for f in file_data if f['total'] >= 5],
+            key=lambda x: x['total']/x['lines'] if x['lines'] > 0 else 0,
+            reverse=True
+        )
+        high_density_list = [{"file": f['path'], "issues": f['total'], "density": round(f['total']/f['lines']*100, 1) if f['lines'] > 0 else 0} for f in high_density[:5]]
+        major_refactors = [{"file": f['path'], "issues": f['total']} for f in file_data[:5]]
 
-        output += "\n## Priority Files (Most Issues)\n\n"
-        output += "| File | Issues | Lines | Density |\n"
-        output += "|------|--------|-------|--------|\n"
-
-        for fd in file_data[:20]:  # Top 20 files
+        # Build priority files list
+        priority_files = []
+        for fd in file_data[:20]:
             density = fd['total'] / fd['lines'] * 100 if fd['lines'] > 0 else 0
-            output += f"| `{fd['path']}` | {fd['total']} | {fd['lines']} | {density:.1f}% |\n"
+            priority_files.append({
+                "file": fd['path'],
+                "issues": fd['total'],
+                "lines": fd['lines'],
+                "density": round(density, 1),
+            })
+
+        response_data = {
+            "path": path,
+            "summary": {
+                "files_requiring_changes": len(file_data),
+                "files_scanned": files_scanned,
+                "total_issues": total_issues,
+                "estimated_effort": effort,
+            },
+            "issues_by_category": category_totals,
+            "priority_files": priority_files,
+            "recommended_order": {
+                "quick_wins": quick_wins,
+                "high_density": high_density_list,
+                "major_refactors": major_refactors,
+            },
+        }
+
+        if skipped_files:
+            response_data["skipped_count"] = len(skipped_files)
+            response_data["skipped_reason"] = f"Exceeded max_files_per_operation limit ({LIMITS['max_files_per_operation']})"
 
         if len(file_data) > 20:
-            output += f"\n*...and {len(file_data) - 20} more files*\n"
+            response_data["additional_files"] = len(file_data) - 20
 
-        output += "\n## Recommended Migration Order\n\n"
-        output += "1. **Quick wins** - Files with few issues (< 5):\n"
-        quick_wins = [f for f in file_data if f['total'] < 5]
-        for fd in quick_wins[:5]:
-            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
+        response = create_response(
+            tool_name=name,
+            status="success",
+            data=response_data,
+            metadata={
+                "limits": LIMITS,
+                "fissix_available": HAS_FISSIX,
+            }
+        )
 
-        output += "\n2. **Core modules** - Fix high-density files first to catch patterns:\n"
-        high_density = sorted([f for f in file_data if f['total'] >= 5],
-                             key=lambda x: x['total']/x['lines'] if x['lines'] > 0 else 0,
-                             reverse=True)
-        for fd in high_density[:5]:
-            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
-
-        output += "\n3. **Major refactors** - Largest files with most issues:\n"
-        for fd in file_data[:5]:
-            output += f"   - `{fd['path']}` ({fd['total']} issues)\n"
-
-        return [TextContent(type="text", text=output)]
+        return [TextContent(type="text", text=response)]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
