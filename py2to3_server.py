@@ -433,6 +433,21 @@ async def list_tools():
                 },
                 "required": ["original_path", "converted_path"]
             }
+        ),
+        Tool(
+            name="scan_compat",
+            description="Run compatibility scan on specific files to detect Python 2 patterns. Returns classified issues with severity, category, and suggested fixes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of file paths to analyze"
+                    }
+                },
+                "required": ["files"]
+            }
         )
     ]
 
@@ -1501,6 +1516,370 @@ Use `six` or `future` libraries for compatibility.
 
         except Exception as e:
             return [TextContent(type="text", text=error_response(name, e, "generating conversion report"))]
+
+    elif name == "scan_compat":
+        files = arguments.get("files", [])
+
+        if not files:
+            error_resp = create_response(
+                tool_name=name,
+                status="error",
+                error={
+                    "type": "NoFilesProvided",
+                    "message": "No files provided for scanning",
+                }
+            )
+            return [TextContent(type="text", text=error_resp)]
+
+        # FR-4.2: Issue classification with severity and categories
+        COMPAT_PATTERNS = {
+            # Deprecated functions (iterators)
+            "xrange": {
+                "pattern": r'\bxrange\s*\(',
+                "code": "PY2-ITER-001",
+                "message": "xrange() is not available in Python 3",
+                "suggested_fix": "Use range() instead",
+                "severity": "error",
+                "category": "iterators"
+            },
+            "iteritems": {
+                "pattern": r'\.iteritems\s*\(',
+                "code": "PY2-ITER-002",
+                "message": "dict.iteritems() is not available in Python 3",
+                "suggested_fix": "Use dict.items() instead",
+                "severity": "error",
+                "category": "iterators"
+            },
+            "itervalues": {
+                "pattern": r'\.itervalues\s*\(',
+                "code": "PY2-ITER-003",
+                "message": "dict.itervalues() is not available in Python 3",
+                "suggested_fix": "Use dict.values() instead",
+                "severity": "error",
+                "category": "iterators"
+            },
+            "iterkeys": {
+                "pattern": r'\.iterkeys\s*\(',
+                "code": "PY2-ITER-004",
+                "message": "dict.iterkeys() is not available in Python 3",
+                "suggested_fix": "Use dict.keys() instead",
+                "severity": "error",
+                "category": "iterators"
+            },
+            "has_key": {
+                "pattern": r'\.has_key\s*\(',
+                "code": "PY2-ITER-005",
+                "message": "dict.has_key() is not available in Python 3",
+                "suggested_fix": "Use 'key in dict' instead",
+                "severity": "error",
+                "category": "iterators"
+            },
+
+            # Obsolete type names (text-types)
+            "unicode_type": {
+                "pattern": r'\bunicode\s*\(',
+                "code": "PY2-TYPE-001",
+                "message": "unicode() is not available in Python 3",
+                "suggested_fix": "Use str() instead",
+                "severity": "error",
+                "category": "text-types"
+            },
+            "long_type": {
+                "pattern": r'(?:\d+|0[xX][0-9a-fA-F]+)[lL]\b',
+                "code": "PY2-TYPE-002",
+                "message": "Long integer suffix L is not valid in Python 3",
+                "suggested_fix": "Remove the L suffix",
+                "severity": "error",
+                "category": "text-types"
+            },
+            "basestring": {
+                "pattern": r'\bbasestring\b',
+                "code": "PY2-TYPE-003",
+                "message": "basestring is not available in Python 3",
+                "suggested_fix": "Use str instead",
+                "severity": "error",
+                "category": "text-types"
+            },
+            "unicode_literal": {
+                "pattern": r'\bu["\']',
+                "code": "PY2-TYPE-004",
+                "message": "Unicode literal prefix u'' is unnecessary in Python 3",
+                "suggested_fix": "Remove the u prefix (all strings are unicode in Python 3)",
+                "severity": "info",
+                "category": "text-types"
+            },
+
+            # Legacy operators
+            "old_ne": {
+                "pattern": r'<>',
+                "code": "PY2-OP-001",
+                "message": "<> comparison operator is not valid in Python 3",
+                "suggested_fix": "Use != instead",
+                "severity": "error",
+                "category": "operators"
+            },
+            "backticks": {
+                "pattern": r'`[^`]+`',
+                "code": "PY2-OP-002",
+                "message": "Backticks for repr are not valid in Python 3",
+                "suggested_fix": "Use repr() instead",
+                "severity": "error",
+                "category": "operators"
+            },
+
+            # Outdated syntax
+            "print_statement": {
+                "pattern": r'^[^#]*\bprint\s+[^(=]',
+                "code": "PY2-SYN-001",
+                "message": "Print statement syntax is not valid in Python 3",
+                "suggested_fix": "Use print() function instead",
+                "severity": "error",
+                "category": "syntax"
+            },
+            "except_comma": {
+                "pattern": r'except\s+[\w.]+\s*,\s*\w+',
+                "code": "PY2-SYN-002",
+                "message": "Old except syntax with comma is not valid in Python 3",
+                "suggested_fix": "Use 'except Exception as e:' instead",
+                "severity": "error",
+                "category": "syntax"
+            },
+            "old_raise": {
+                "pattern": r'raise\s+[\w.]+\s*,',
+                "code": "PY2-SYN-003",
+                "message": "Old raise syntax is not valid in Python 3",
+                "suggested_fix": "Use raise Exception('message') instead",
+                "severity": "error",
+                "category": "syntax"
+            },
+            "exec_statement": {
+                "pattern": r'^[^#]*\bexec\s+[^(]',
+                "code": "PY2-SYN-004",
+                "message": "exec statement syntax is not valid in Python 3",
+                "suggested_fix": "Use exec() function instead",
+                "severity": "error",
+                "category": "syntax"
+            },
+
+            # Relocated stdlib modules
+            "ConfigParser": {
+                "pattern": r'(?<!\w)ConfigParser\b',
+                "code": "PY2-LIB-001",
+                "message": "ConfigParser module was renamed in Python 3",
+                "suggested_fix": "Use 'import configparser' instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "StringIO": {
+                "pattern": r'(?<!\w)StringIO\b(?!\.)',
+                "code": "PY2-LIB-002",
+                "message": "StringIO module was moved in Python 3",
+                "suggested_fix": "Use 'from io import StringIO' instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "cStringIO": {
+                "pattern": r'\bcStringIO\b',
+                "code": "PY2-LIB-003",
+                "message": "cStringIO is not available in Python 3",
+                "suggested_fix": "Use 'from io import StringIO' instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "cPickle": {
+                "pattern": r'\bcPickle\b',
+                "code": "PY2-LIB-004",
+                "message": "cPickle is not available in Python 3",
+                "suggested_fix": "Use 'import pickle' instead (it's fast in Python 3)",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "Queue": {
+                "pattern": r'(?<!\w)Queue\b',
+                "code": "PY2-LIB-005",
+                "message": "Queue module was renamed in Python 3",
+                "suggested_fix": "Use 'import queue' instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "urllib2": {
+                "pattern": r'\burllib2\b',
+                "code": "PY2-LIB-006",
+                "message": "urllib2 is not available in Python 3",
+                "suggested_fix": "Use urllib.request and urllib.error instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "urlparse": {
+                "pattern": r'\burlparse\b',
+                "code": "PY2-LIB-007",
+                "message": "urlparse module was moved in Python 3",
+                "suggested_fix": "Use urllib.parse instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "httplib": {
+                "pattern": r'\bhttplib\b',
+                "code": "PY2-LIB-008",
+                "message": "httplib was renamed in Python 3",
+                "suggested_fix": "Use http.client instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+            "HTMLParser": {
+                "pattern": r'\bHTMLParser\b',
+                "code": "PY2-LIB-009",
+                "message": "HTMLParser module was moved in Python 3",
+                "suggested_fix": "Use html.parser instead",
+                "severity": "error",
+                "category": "stdlib-move"
+            },
+
+            # Other deprecated builtins
+            "raw_input": {
+                "pattern": r'\braw_input\s*\(',
+                "code": "PY2-BUILTIN-001",
+                "message": "raw_input() is not available in Python 3",
+                "suggested_fix": "Use input() instead",
+                "severity": "error",
+                "category": "builtins"
+            },
+            "execfile": {
+                "pattern": r'\bexecfile\s*\(',
+                "code": "PY2-BUILTIN-002",
+                "message": "execfile() is not available in Python 3",
+                "suggested_fix": "Use exec(open(file).read()) instead",
+                "severity": "error",
+                "category": "builtins"
+            },
+            "reduce": {
+                "pattern": r'(?<![\.\w])reduce\s*\(',
+                "code": "PY2-BUILTIN-003",
+                "message": "reduce() was moved to functools in Python 3",
+                "suggested_fix": "Use 'from functools import reduce'",
+                "severity": "warning",
+                "category": "builtins"
+            },
+            "apply": {
+                "pattern": r'(?<!\w)apply\s*\(',
+                "code": "PY2-BUILTIN-004",
+                "message": "apply() is not available in Python 3",
+                "suggested_fix": "Use func(*args, **kwargs) instead",
+                "severity": "error",
+                "category": "builtins"
+            },
+            "file_builtin": {
+                "pattern": r'(?<!\w)file\s*\(',
+                "code": "PY2-BUILTIN-005",
+                "message": "file() builtin is not available in Python 3",
+                "suggested_fix": "Use open() instead",
+                "severity": "error",
+                "category": "builtins"
+            },
+            "cmp_func": {
+                "pattern": r'\bcmp\s*\(',
+                "code": "PY2-BUILTIN-006",
+                "message": "cmp() is not available in Python 3",
+                "suggested_fix": "Use (a > b) - (a < b) or functools.cmp_to_key",
+                "severity": "error",
+                "category": "builtins"
+            },
+        }
+
+        all_issues = []
+        files_scanned = 0
+        files_with_issues = 0
+        category_counts = {}
+        severity_counts = {"error": 0, "warning": 0, "info": 0}
+
+        for filepath in files:
+            if not os.path.isfile(filepath):
+                all_issues.append({
+                    "file": filepath,
+                    "line": 0,
+                    "code": "SCAN-ERR-001",
+                    "message": f"File not found: {filepath}",
+                    "severity": "error",
+                    "category": "scan-error"
+                })
+                continue
+
+            # Check file size
+            try:
+                if os.path.getsize(filepath) > LIMITS["max_file_size_bytes"]:
+                    all_issues.append({
+                        "file": filepath,
+                        "line": 0,
+                        "code": "SCAN-ERR-002",
+                        "message": f"File exceeds size limit ({LIMITS['max_file_size_bytes']} bytes)",
+                        "severity": "warning",
+                        "category": "scan-error"
+                    })
+                    continue
+            except OSError:
+                continue
+
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+
+                files_scanned += 1
+                file_has_issues = False
+
+                for line_num, line in enumerate(lines, 1):
+                    # Skip shebang and encoding lines
+                    if line_num <= 2 and (line.startswith('#!') or 'coding' in line):
+                        continue
+
+                    for pattern_name, pattern_info in COMPAT_PATTERNS.items():
+                        if re.search(pattern_info["pattern"], line):
+                            file_has_issues = True
+                            issue = {
+                                "file": filepath,
+                                "line": line_num,
+                                "code": pattern_info["code"],
+                                "message": pattern_info["message"],
+                                "suggested_fix": pattern_info["suggested_fix"],
+                                "severity": pattern_info["severity"],
+                                "category": pattern_info["category"],
+                                "source": line.strip()
+                            }
+                            all_issues.append(issue)
+
+                            # Update counts
+                            severity_counts[pattern_info["severity"]] += 1
+                            cat = pattern_info["category"]
+                            category_counts[cat] = category_counts.get(cat, 0) + 1
+
+                if file_has_issues:
+                    files_with_issues += 1
+
+            except Exception as e:
+                all_issues.append({
+                    "file": filepath,
+                    "line": 0,
+                    "code": "SCAN-ERR-003",
+                    "message": f"Error reading file: {str(e)}",
+                    "severity": "error",
+                    "category": "scan-error"
+                })
+
+        response = create_response(
+            tool_name=name,
+            status="success",
+            data={
+                "issues": all_issues,
+                "summary": {
+                    "total_issues": len(all_issues),
+                    "files_scanned": files_scanned,
+                    "files_with_issues": files_with_issues,
+                    "by_severity": severity_counts,
+                    "by_category": category_counts,
+                },
+            },
+            metadata={"limits": LIMITS}
+        )
+        return [TextContent(type="text", text=response)]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
